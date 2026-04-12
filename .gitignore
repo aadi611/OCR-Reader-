@@ -1,0 +1,79 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Model weights & checkpoints (large binaries — download via script) ────────
+pretrain_models/**/*.pdparams
+pretrain_models/**/*.pdopt
+pretrain_models/**/*.states
+pretrain_models/**/*.pdmodel
+pretrain_models/**/*.pdiparams
+pretrain_models/**/._*
+output/
+inference/
+
+# ── PaddlePaddle / PaddleX auto-downloaded model cache ───────────────────────
+.paddlex/
+
+# ── Training data (add your own — too large for git) ─────────────────────────
+train_data/det/train/*
+train_data/det/val/*
+train_data/rec/train/*
+train_data/rec/val/*
+!train_data/**/.gitkeep
+
+# ── Archives & large files ────────────────────────────────────────────────────
+*.tar
+*.tar.gz
+*.tar.bz2
+*.zip
+*.7z
+*.rar
+
+# ── Logs & temp files ─────────────────────────────────────────────────────────
+*.log
+*.log.*
+logs/
+runs/
+visualdl_log/
+
+# ── Test / scratch images (don't commit random test files) ───────────────────
+test.jpg
+test.png
+scratch.*
+sample.*
+
+# ── OS junk ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+.env.*
+secrets.json
+credentials.json
+
+# ── Claude Code internal ──────────────────────────────────────────────────────
+.claude/

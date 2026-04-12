@@ -1,0 +1,4 @@
+# Format: image_path\ttext
+# Example:
+# train/word_001.jpg	hello world
+train/word_001.jpg	hello world

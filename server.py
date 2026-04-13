@@ -26,7 +26,9 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import cv2
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -78,22 +80,17 @@ async def lifespan(app: FastAPI):
         from paddleocr import PaddleOCR
 
         kwargs: Dict[str, Any] = dict(
-            use_angle_cls=True,
+            use_textline_orientation=True,
             lang="en",
-            use_gpu=USE_GPU,
-            show_log=False,
-            rec_char_dict_path=REC_CHAR_DICT if os.path.isfile(REC_CHAR_DICT) else None,
-            # Handwriting-tuned parameters
-            det_db_thresh=0.3,
-            det_db_box_thresh=0.5,
-            det_db_unclip_ratio=2.0,
-            rec_image_shape="3,48,320",
-            max_text_length=40,
+            device="gpu" if USE_GPU else "cpu",
+            text_det_thresh=0.3,
+            text_det_box_thresh=0.5,
+            text_det_unclip_ratio=2.0,
         )
         if DET_MODEL_DIR:
-            kwargs["det_model_dir"] = DET_MODEL_DIR
+            kwargs["text_detection_model_dir"] = DET_MODEL_DIR
         if REC_MODEL_DIR:
-            kwargs["rec_model_dir"] = REC_MODEL_DIR
+            kwargs["text_recognition_model_dir"] = REC_MODEL_DIR
 
         _ocr_engine = PaddleOCR(**kwargs)
         logger.info("PaddleOCR engine loaded successfully.")
@@ -123,6 +120,23 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve frontend
+_frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
+if os.path.isdir(_frontend_dir):
+    app.mount("/static", StaticFiles(directory=_frontend_dir), name="static")
+
+@app.get("/", include_in_schema=False)
+async def serve_frontend():
+    index = os.path.join(_frontend_dir, "index.html")
+    return FileResponse(index) if os.path.isfile(index) else JSONResponse({"detail": "Frontend not found"}, 404)
 
 
 # ---------------------------------------------------------------------------
@@ -155,29 +169,26 @@ def _run_ocr(img: np.ndarray) -> Dict[str, Any]:
         raise RuntimeError("OCR engine is not available (startup failed).")
 
     t0 = time.perf_counter()
-    results = _ocr_engine.ocr(img, cls=True)
+    results = _ocr_engine.predict(img)
     elapsed = time.perf_counter() - t0
 
     words: List[Dict[str, Any]] = []
     lines_text: List[str] = []
 
-    if results and results[0] is not None:
-        for line in results[0]:
-            if line is None:
+    result = results[0] if results else None
+    if result and isinstance(result, dict) and "rec_texts" in result:
+        for text, confidence, bbox in zip(
+            result.get("rec_texts", []),
+            result.get("rec_scores", []),
+            result.get("rec_polys", []),
+        ):
+            if confidence is None or float(confidence) < CONF_THRESHOLD:
                 continue
-            bbox, (text, confidence) = line
-            if confidence < CONF_THRESHOLD:
-                continue
-            words.append(
-                {
-                    "text": text,
-                    "confidence": round(float(confidence), 4),
-                    "bbox": [
-                        [round(float(pt[0]), 1), round(float(pt[1]), 1)]
-                        for pt in bbox
-                    ],
-                }
-            )
+            words.append({
+                "text": text,
+                "confidence": round(float(confidence), 4),
+                "bbox": [[round(float(pt[0]), 1), round(float(pt[1]), 1)] for pt in bbox],
+            })
             lines_text.append(text)
 
     full_text = " ".join(lines_text)

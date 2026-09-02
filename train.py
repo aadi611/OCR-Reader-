@@ -1,303 +1,422 @@
 """
-Training wrapper script for PaddleOCR handwriting models.
+Training wrapper for PaddleOCR handwriting models.
 
-Runs detection and/or recognition training by calling PaddleOCR's
-tools/train.py with the appropriate configuration and GPU arguments.
+Drives PaddleOCR's tools/train.py (or tools/eval.py) with the right config,
+GPU topology and override flags, streams the child's output to both the
+terminal and a log file, and shuts the child down cleanly on Ctrl-C.
 
 Usage:
-    # Train both detection and recognition (sequential)
-    python train.py --stage both
-
-    # Train detection only on GPU 0
+    python train.py --stage both                       # det then rec
     python train.py --stage det --gpus 0
-
-    # Train recognition on GPUs 0 and 1 with a custom config
-    python train.py --stage rec --gpus 0,1 --config-rec configs/rec/my_rec.yml
-
-    # Resume from a checkpoint
-    python train.py --stage rec --resume
+    python train.py --stage rec --gpus 0,1 --amp       # mixed precision
+    python train.py --stage rec --resume               # from latest checkpoint
+    python train.py --stage rec --eval-only            # runs tools/eval.py
+    python train.py --stage both --dry-run             # print commands, do nothing
+    python train.py --stage rec -o Global.epoch_num=50 Optimizer.lr.learning_rate=0.0005
 """
 
+from __future__ import annotations
+
 import argparse
+import importlib.util
 import os
+import re
+import shutil
+import signal
 import subprocess
 import sys
 import time
-from typing import List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+IS_POSIX = os.name == "posix"
 
 
 # ---------------------------------------------------------------------------
-# Argument parsing
+# Arguments
 # ---------------------------------------------------------------------------
-
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train PaddleOCR detection and/or recognition models",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--stage",
-        choices=["det", "rec", "both"],
-        default="both",
-        help="Which stage to train: detection, recognition, or both (sequential).",
-    )
-    parser.add_argument(
-        "--config-det",
-        default="./configs/det/handwriting_det.yml",
-        help="Path to the detection config YAML.",
-    )
-    parser.add_argument(
-        "--config-rec",
-        default="./configs/rec/handwriting_rec_svtr.yml",
-        help="Path to the recognition config YAML.",
-    )
-    parser.add_argument(
-        "--gpus",
-        default="0",
-        help="Comma-separated GPU IDs to use (e.g. '0' or '0,1,2,3').",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        default=False,
-        help="Resume training from the latest checkpoint in save_model_dir.",
-    )
-    parser.add_argument(
-        "--eval-only",
-        action="store_true",
-        default=False,
-        help="Run evaluation only (no training).",
-    )
-    parser.add_argument(
-        "--paddle-train-script",
-        default=None,
-        help="Explicit path to PaddleOCR's tools/train.py. "
-             "Auto-detected from paddleocr package if not set.",
-    )
-    return parser.parse_args()
+    parser.add_argument("--stage", choices=["det", "rec", "both"], default="both",
+                        help="Detection, recognition, or both (sequential).")
+    parser.add_argument("--config-det", default="./configs/det/handwriting_det.yml",
+                        help="Detection config YAML.")
+    parser.add_argument("--config-rec", default="./configs/rec/handwriting_rec_svtr.yml",
+                        help="Recognition config YAML.")
+    parser.add_argument("--gpus", default="0",
+                        help="Comma-separated GPU IDs, or 'cpu' to train on CPU.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from <save_model_dir>/latest.")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Explicit checkpoint prefix; overrides --resume's guess.")
+    parser.add_argument("--pretrained", default=None,
+                        help="Pretrained weights prefix (Global.pretrained_model).")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Run tools/eval.py instead of training.")
+    parser.add_argument("--amp", action="store_true",
+                        help="Enable mixed precision (usually 1.5-2x faster on modern GPUs).")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="Run later stages even if an earlier one fails.")
+    parser.add_argument("--log-dir", default="./logs",
+                        help="Directory for per-stage log files. Empty string disables.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the commands that would run, then exit.")
+    parser.add_argument("--paddle-train-script", default=None,
+                        help="Explicit path to PaddleOCR's tools/train.py.")
+    parser.add_argument("-o", "--opt", nargs="+", default=[], metavar="KEY=VALUE",
+                        help="Extra config overrides passed straight through to PaddleOCR.")
+    return parser.parse_args(argv)
 
 
 # ---------------------------------------------------------------------------
-# Locate PaddleOCR train script
+# Locating PaddleOCR's tools/
 # ---------------------------------------------------------------------------
-
-def find_paddle_train_script(explicit_path: Optional[str] = None) -> str:
+def find_tools_dir(explicit_train_script: str | None = None) -> Path:
     """
-    Find the path to PaddleOCR's tools/train.py.
+    Return the directory holding train.py / eval.py.
 
-    Checks (in order):
-      1. The explicit path argument.
-      2. The paddleocr package installation directory.
-      3. A local PaddleOCR checkout in the current working directory.
-
-    Raises:
-        FileNotFoundError: if the script cannot be located.
+    Uses importlib's finder rather than importing paddleocr — importing the
+    package costs several seconds and pulls in paddle just to read a path.
     """
-    if explicit_path and os.path.isfile(explicit_path):
-        return explicit_path
+    if explicit_train_script:
+        p = Path(explicit_train_script).expanduser()
+        if p.is_file():
+            return p.parent
+        raise FileNotFoundError(f"--paddle-train-script not found: {p}")
 
-    # Try the installed paddleocr package location
-    try:
-        import paddleocr as _poc
+    candidates: list[Path] = []
 
-        package_dir = os.path.dirname(_poc.__file__)
-        candidate = os.path.join(package_dir, "tools", "train.py")
-        if os.path.isfile(candidate):
-            return candidate
+    env_home = os.environ.get("PADDLEOCR_HOME")
+    if env_home:
+        candidates.append(Path(env_home) / "tools")
 
-        # Some installations place it one level up
-        candidate2 = os.path.join(package_dir, "..", "tools", "train.py")
-        candidate2 = os.path.normpath(candidate2)
-        if os.path.isfile(candidate2):
-            return candidate2
-    except ImportError:
-        pass
+    spec = importlib.util.find_spec("paddleocr")
+    origin = getattr(spec, "origin", None) if spec else None
+    if origin:
+        pkg = Path(origin).parent
+        candidates += [pkg / "tools", pkg.parent / "tools"]
 
-    # Try a local PaddleOCR source checkout
-    local_candidate = os.path.join(os.getcwd(), "PaddleOCR", "tools", "train.py")
-    if os.path.isfile(local_candidate):
-        return local_candidate
+    cwd = Path.cwd()
+    candidates += [cwd / "PaddleOCR" / "tools", cwd / "tools"]
+
+    for c in candidates:
+        if (c / "train.py").is_file():
+            return c.resolve()
 
     raise FileNotFoundError(
-        "Cannot locate PaddleOCR tools/train.py. "
-        "Please install paddleocr or pass --paddle-train-script."
+        "Cannot locate PaddleOCR tools/train.py. Install paddleocr, set "
+        "PADDLEOCR_HOME, or pass --paddle-train-script."
     )
 
 
 # ---------------------------------------------------------------------------
-# GPU environment setup
+# Config inspection
 # ---------------------------------------------------------------------------
-
-def build_gpu_env(gpus: str) -> dict:
-    """
-    Build environment variables for multi-GPU training.
-
-    Returns a copy of os.environ with CUDA_VISIBLE_DEVICES set.
-    """
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = gpus
-    return env
+_SAVE_DIR_RE = re.compile(r"^\s*save_model_dir\s*:\s*[\"']?([^\"'#\n]+)", re.M)
 
 
-def get_gpu_count(gpus: str) -> int:
-    """Count the number of GPUs specified."""
-    return len([g.strip() for g in gpus.split(",") if g.strip()])
-
-
-# ---------------------------------------------------------------------------
-# Build training command
-# ---------------------------------------------------------------------------
-
-def build_train_command(
-    train_script: str,
-    config_path: str,
-    gpus: str,
-    resume: bool = False,
-    eval_only: bool = False,
-) -> List[str]:
-    """
-    Construct the command list for subprocess to run PaddleOCR training.
-
-    Args:
-        train_script: Path to tools/train.py.
-        config_path:  Path to the YAML config file.
-        gpus:         Comma-separated GPU IDs string.
-        resume:       If True, pass -c checkpoint flag to resume training.
-        eval_only:    If True, pass -o eval flag.
-
-    Returns:
-        List of command tokens.
-    """
-    n_gpus = get_gpu_count(gpus)
-
-    if n_gpus > 1:
-        # Multi-GPU: use paddle.distributed.launch
-        cmd = [
-            sys.executable, "-m", "paddle.distributed.launch",
-            f"--gpus={gpus}",
-            train_script,
-            "-c", config_path,
-        ]
-    else:
-        cmd = [sys.executable, train_script, "-c", config_path]
-
-    if eval_only:
-        cmd += ["-o", "Global.infer_mode=true"]
-
-    if resume:
-        # Instruct train.py to resume from the latest checkpoint
-        cmd += ["-o", "Global.checkpoints=latest"]
-
-    return cmd
-
-
-# ---------------------------------------------------------------------------
-# Run a single training stage
-# ---------------------------------------------------------------------------
-
-def run_stage(
-    stage_name: str,
-    train_script: str,
-    config_path: str,
-    gpus: str,
-    resume: bool,
-    eval_only: bool,
-) -> int:
-    """
-    Execute one training stage and return the subprocess exit code.
-    """
-    if not os.path.isfile(config_path):
-        print(f"[ERROR] Config file not found: {config_path}", file=sys.stderr)
-        return 1
-
-    cmd = build_train_command(train_script, config_path, gpus, resume, eval_only)
-    env = build_gpu_env(gpus)
-    n_gpus = get_gpu_count(gpus)
-
-    mode = "Evaluation" if eval_only else "Training"
-    print()
-    print("=" * 72)
-    print(f"  {mode} Stage: {stage_name.upper()}")
-    print(f"  Config  : {config_path}")
-    print(f"  GPUs    : {gpus} ({n_gpus} device(s))")
-    print(f"  Resume  : {resume}")
-    print(f"  Command : {' '.join(cmd)}")
-    print("=" * 72)
-
-    t0 = time.time()
+def read_save_model_dir(config_path: Path) -> str | None:
+    """Pull Global.save_model_dir out of the YAML (PyYAML optional)."""
     try:
-        result = subprocess.run(cmd, env=env, check=False)
-        exit_code = result.returncode
-    except KeyboardInterrupt:
-        print(f"\n[INTERRUPTED] {stage_name} training interrupted by user.")
-        exit_code = 130
+        import yaml  # noqa: PLC0415
+
+        with open(config_path, "r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        value = (cfg.get("Global") or {}).get("save_model_dir")
+        if value:
+            return str(value).strip()
+    except ImportError:
+        pass
     except Exception as exc:
-        print(f"[ERROR] Failed to launch {stage_name} training: {exc}", file=sys.stderr)
-        exit_code = 1
+        print(f"[WARN] could not parse {config_path}: {exc}", file=sys.stderr)
 
-    elapsed = time.time() - t0
-    hours, rem = divmod(int(elapsed), 3600)
-    minutes, seconds = divmod(rem, 60)
+    try:
+        match = _SAVE_DIR_RE.search(config_path.read_text(encoding="utf-8"))
+        return match.group(1).strip() if match else None
+    except OSError:
+        return None
 
-    status = "SUCCESS" if exit_code == 0 else f"FAILED (exit {exit_code})"
-    print()
-    print(f"  {stage_name.upper()} training finished: {status}")
-    print(f"  Elapsed time: {hours:02d}:{minutes:02d}:{seconds:02d}")
-    print("=" * 72)
 
-    return exit_code
+def resolve_checkpoint(config_path: Path, explicit: str | None) -> str | None:
+    """
+    Work out the checkpoint prefix to resume from.
+
+    PaddleOCR wants a path prefix such as ./output/rec/latest — the literal
+    string "latest" is not a valid value and silently starts from scratch.
+    """
+    if explicit:
+        return explicit
+    save_dir = read_save_model_dir(config_path)
+    if not save_dir:
+        print("[WARN] --resume: no Global.save_model_dir in config; "
+              "pass --checkpoint explicitly.", file=sys.stderr)
+        return None
+    prefix = Path(save_dir) / "latest"
+    if not prefix.with_suffix(".pdparams").is_file():
+        print(f"[WARN] --resume: no checkpoint at {prefix}.pdparams — "
+              "training will start from scratch.", file=sys.stderr)
+        return None
+    return str(prefix)
+
+
+# ---------------------------------------------------------------------------
+# Command construction
+# ---------------------------------------------------------------------------
+def gpu_ids(gpus: str) -> list[str]:
+    if gpus.strip().lower() in ("", "cpu", "none", "-1"):
+        return []
+    return [g.strip() for g in gpus.split(",") if g.strip()]
+
+
+def build_command(
+    tools_dir: Path, config_path: Path, args: argparse.Namespace
+) -> tuple[list[str], dict[str, str]]:
+    """Build the argv and environment for one stage."""
+    script = tools_dir / ("eval.py" if args.eval_only else "train.py")
+    if not script.is_file():
+        raise FileNotFoundError(f"{script} not found next to train.py")
+
+    ids = gpu_ids(args.gpus)
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")       # stream child logs live
+    env.setdefault("FLAGS_allocator_strategy", "auto_growth")
+
+    if not ids:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        cmd = [sys.executable, str(script)]
+    elif len(ids) == 1:
+        env["CUDA_VISIBLE_DEVICES"] = ids[0]
+        cmd = [sys.executable, str(script)]
+    else:
+        # Let launch own the device selection. Setting CUDA_VISIBLE_DEVICES as
+        # well makes --gpus indices relative to that mask and re-maps twice.
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+        cmd = [sys.executable, "-m", "paddle.distributed.launch",
+               f"--gpus={','.join(ids)}", str(script)]
+
+    cmd += ["-c", str(config_path)]
+
+    # PaddleOCR's -o takes nargs='+' with a plain store action, so a second -o
+    # REPLACES the first. Every override has to go in one list.
+    overrides: list[str] = []
+    if not ids:
+        overrides.append("Global.use_gpu=False")
+    if args.amp and ids:
+        overrides += ["Global.use_amp=True", "Global.scale_loss=1024.0",
+                      "Global.use_dynamic_loss_scaling=True"]
+    if args.pretrained:
+        overrides.append(f"Global.pretrained_model={args.pretrained}")
+    ckpt = (resolve_checkpoint(config_path, args.checkpoint)
+            if (args.resume or args.checkpoint or args.eval_only) else None)
+    if ckpt:
+        overrides.append(f"Global.checkpoints={ckpt}")
+    overrides += list(args.opt)
+    if overrides:
+        cmd += ["-o", *overrides]
+
+    return cmd, env
+
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+@dataclass
+class StageResult:
+    name: str
+    exit_code: int
+    elapsed: float
+    log_path: Path | None = None
+    skipped: bool = False
+
+
+_child: subprocess.Popen | None = None
+_interrupted = False
+
+
+def _forward_signal(signum, _frame) -> None:
+    """Pass Ctrl-C / SIGTERM to the training process instead of orphaning it."""
+    global _interrupted
+    _interrupted = True
+    proc = _child
+    if proc and proc.poll() is None:
+        try:
+            if IS_POSIX:
+                os.killpg(os.getpgid(proc.pid), signum)
+            else:
+                proc.terminate()
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def run_command(cmd: list[str], env: dict[str, str], log_path: Path | None) -> int:
+    """Run the child, teeing its output to the terminal and (optionally) a file."""
+    global _child
+
+    stdout = subprocess.PIPE if log_path else None
+    log_file = None
+    if log_path:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_path, "wb", buffering=0)
+
+    popen_kwargs: dict = {"env": env, "stdout": stdout}
+    if log_path:
+        popen_kwargs["stderr"] = subprocess.STDOUT
+    if IS_POSIX:
+        popen_kwargs["start_new_session"] = True   # own group, so we can signal it
+    else:
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    previous = {
+        sig: signal.signal(sig, _forward_signal)
+        for sig in (signal.SIGINT, signal.SIGTERM)
+        if hasattr(signal, sig.name)
+    }
+    try:
+        _child = subprocess.Popen(cmd, **popen_kwargs)
+        if log_file is not None and _child.stdout is not None:
+            out = sys.stdout.buffer
+            # Chunked, not line-based: keeps \r progress bars rendering properly.
+            while chunk := _child.stdout.read(4096):
+                out.write(chunk)
+                out.flush()
+                log_file.write(chunk)
+        code = _child.wait()
+        if code != 0 and _interrupted:
+            code = 130
+        return code
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if log_file is not None:
+            log_file.close()
+        _child = None
+
+
+def run_stage(name: str, tools_dir: Path, config_path: Path,
+              args: argparse.Namespace) -> StageResult:
+    cmd, env = build_command(tools_dir, config_path, args)
+    ids = gpu_ids(args.gpus)
+    mode = "Evaluation" if args.eval_only else "Training"
+    log_path = (Path(args.log_dir) / f"{name}_{time.strftime('%Y%m%d_%H%M%S')}.log"
+                if args.log_dir else None)
+
+    print("\n" + "=" * 72)
+    print(f"  {mode} stage : {name.upper()}")
+    print(f"  Config       : {config_path}")
+    print(f"  Devices      : {', '.join(ids) if ids else 'CPU'}"
+          f"{f' ({len(ids)} GPUs, distributed)' if len(ids) > 1 else ''}")
+    print(f"  AMP          : {bool(args.amp and ids)}")
+    if log_path:
+        print(f"  Log          : {log_path}")
+    print(f"  Command      : {' '.join(cmd)}")
+    print("=" * 72, flush=True)
+
+    if args.dry_run:
+        return StageResult(name, 0, 0.0, log_path, skipped=True)
+
+    t0 = time.monotonic()
+    try:
+        code = run_command(cmd, env, log_path)
+    except FileNotFoundError as exc:
+        print(f"[ERROR] cannot launch {name}: {exc}", file=sys.stderr)
+        code = 127
+    elapsed = time.monotonic() - t0
+
+    status = "SUCCESS" if code == 0 else ("INTERRUPTED" if code == 130 else f"FAILED ({code})")
+    print(f"\n  {name.upper()} {mode.lower()} finished: {status}")
+    print(f"  Elapsed: {format_hms(elapsed)}")
+    print("=" * 72, flush=True)
+    return StageResult(name, code, elapsed, log_path)
+
+
+def format_hms(seconds: float) -> str:
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+def check_gpus(ids: Sequence[str]) -> None:
+    """Warn about missing GPUs now rather than 30 seconds into a doomed launch."""
+    if not ids or not shutil.which("nvidia-smi"):
+        return
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    available = {line.strip() for line in out.splitlines() if line.strip()}
+    missing = [g for g in ids if g not in available]
+    if missing:
+        print(f"[WARN] GPU(s) {','.join(missing)} not visible to nvidia-smi "
+              f"(present: {','.join(sorted(available)) or 'none'}).", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
 
-def main() -> None:
-    args = parse_args()
-
-    # Locate train.py
     try:
-        train_script = find_paddle_train_script(args.paddle_train_script)
-        print(f"PaddleOCR train script: {train_script}")
+        tools_dir = find_tools_dir(args.paddle_train_script)
     except FileNotFoundError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
-        sys.exit(1)
+        return 1
+    print(f"PaddleOCR tools: {tools_dir}")
 
-    stages_to_run: List[str] = []
-    if args.stage in ("det", "both"):
-        stages_to_run.append("det")
-    if args.stage in ("rec", "both"):
-        stages_to_run.append("rec")
+    stages = ["det", "rec"] if args.stage == "both" else [args.stage]
+    configs = {"det": Path(args.config_det), "rec": Path(args.config_rec)}
 
-    config_map = {
-        "det": args.config_det,
-        "rec": args.config_rec,
-    }
+    # Validate every config before the first stage — a missing rec config
+    # should not surface six hours into det training.
+    missing = [str(configs[s]) for s in stages if not configs[s].is_file()]
+    if missing:
+        print(f"[ERROR] config file(s) not found: {', '.join(missing)}", file=sys.stderr)
+        return 1
 
-    overall_exit = 0
-    for stage in stages_to_run:
-        exit_code = run_stage(
-            stage_name=stage,
-            train_script=train_script,
-            config_path=config_map[stage],
-            gpus=args.gpus,
-            resume=args.resume,
-            eval_only=args.eval_only,
-        )
-        if exit_code != 0:
-            overall_exit = exit_code
-            print(
-                f"[WARN] Stage '{stage}' failed with exit code {exit_code}. "
-                "Continuing to next stage..." if len(stages_to_run) > 1 else "",
-                file=sys.stderr,
-            )
+    check_gpus(gpu_ids(args.gpus))
 
-    if overall_exit == 0:
-        print("\nAll requested training stages completed successfully.")
+    results: list[StageResult] = []
+    for stage in stages:
+        result = run_stage(stage, tools_dir, configs[stage], args)
+        results.append(result)
+        if result.exit_code == 130:
+            print("[INTERRUPTED] stopping; remaining stages skipped.", file=sys.stderr)
+            break
+        if result.exit_code != 0 and not args.keep_going:
+            print(f"[ERROR] stage '{stage}' failed (exit {result.exit_code}); "
+                  "remaining stages skipped. Use --keep-going to override.",
+                  file=sys.stderr)
+            break
+
+    if len(results) > 1 or any(r.exit_code for r in results):
+        print("\n" + "-" * 72)
+        print(f"  {'Stage':<8} {'Status':<14} {'Elapsed':>10}  Log")
+        print("-" * 72)
+        for r in results:
+            status = ("DRY-RUN" if r.skipped else
+                      "SUCCESS" if r.exit_code == 0 else
+                      "INTERRUPTED" if r.exit_code == 130 else f"FAILED ({r.exit_code})")
+            print(f"  {r.name.upper():<8} {status:<14} {format_hms(r.elapsed):>10}  "
+                  f"{r.log_path or '-'}")
+        print("-" * 72)
+
+    worst = next((r.exit_code for r in results if r.exit_code), 0)
+    if worst == 0:
+        print("\nAll requested stages completed successfully.")
     else:
-        print(f"\nOne or more training stages failed (exit code {overall_exit}).", file=sys.stderr)
-        sys.exit(overall_exit)
+        print(f"\nOne or more stages did not succeed (exit {worst}).", file=sys.stderr)
+    return worst
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
